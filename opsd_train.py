@@ -1,11 +1,10 @@
 import os
-import wandb
 
-from datasets import load_dataset
-from transformers import AutoTokenizer, GenerationConfig
+from transformers import AutoTokenizer
+
+from data import get_data
 
 from trl import (
-    LogCompletionsCallback,
     ModelConfig,
     ScriptArguments,
     TrlParser,
@@ -16,9 +15,6 @@ from trl import (
 from trl.experimental.gold import GOLDConfig
 from opsd_trainer import OPSDTrainer
 from dataclasses import dataclass, field
-
-# Enable logging in a Hugging Face Space
-os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
 @dataclass
@@ -42,8 +38,8 @@ class CustomScriptArguments(ScriptArguments):
     run_config: str = field(
         default=None,
         metadata={
-            "help": "Run name for this experiment. Will be used for both the output directory "
-            "(appended to output_dir) and WandB run name. If not specified, will generate "
+            "help": "Run name for this experiment. Will be used as a suffix for the output directory "
+            "(appended to output_dir). If not specified, will generate "
             "automatic name based on hyperparameters."
         },
     )
@@ -99,13 +95,13 @@ if __name__ == "__main__":
     script_args, training_args, model_args = parser.parse_args_and_config()
 
     ################
-    # WandB Run Name & Output Directory
+    # Run Name & Output Directory
     ################
     # Format learning rate (e.g., 2e-4 -> "2e-4" or 0.0002 -> "2e-4")
     lr_str = f"{training_args.learning_rate:.0e}".replace("e-0", "e-")
 
-    # Get number of processes from environment (set by accelerate launch)
-    num_processes = int(os.environ.get("WORLD_SIZE", 1))
+    # Single-GPU training: always 1 process.
+    num_processes = 1
 
     # Calculate effective batch size
     effective_batch_size = (
@@ -114,7 +110,7 @@ if __name__ == "__main__":
 
     # Use custom run_config if provided, otherwise generate automatic name
     if script_args.run_config:
-        full_wandb_run_config = f"{script_args.run_config}_lr{lr_str}_bs{effective_batch_size}"
+        full_run_name = f"{script_args.run_config}_lr{lr_str}_bs{effective_batch_size}"
         # Append run_config to output_dir if it doesn't already end with it
         if not training_args.output_dir.endswith(script_args.run_config):
             from pathlib import Path
@@ -125,63 +121,29 @@ if __name__ == "__main__":
         model_name = model_args.model_name_or_path.split("/")[-1]
 
         # Create concise run name
-        full_wandb_run_config = (
+        full_run_name = (
             f"opsd_{model_name}_"
             f"lr{lr_str}_"
             f"bs{effective_batch_size}_"
             f"tok{training_args.max_completion_length}"
         )
 
-        # Add fixed_teacher to wandb name if enabled
+        # Add fixed_teacher to run name if enabled
         if script_args.fixed_teacher:
-            full_wandb_run_config += "_fixteach"
+            full_run_name += "_fixteach"
 
     # Print configuration info
     print(f"\n{'='*80}")
     print(f"RUN CONFIGURATION")
     print(f"{'='*80}")
-    print(f"WandB Run Name: {full_wandb_run_config}")
+    print(f"Run Name: {full_run_name}")
     print(f"Output Directory: {training_args.output_dir}")
     print(f"{'='*80}\n")
 
-    ################
-    # WandB Initialization
-    ################
     # Validate fixed_teacher argument
     if script_args.fixed_teacher and not model_args.use_peft:
         raise ValueError(
             "fixed_teacher=True requires use_peft=True. As the fixed teacher is implemented by disabling LoRA adapters."
-        )
-
-    # Only initialize wandb on main process (LOCAL_RANK 0 or not set)
-    if os.environ.get("LOCAL_RANK", "0") == "0":
-        wandb.init(
-            entity=training_args.wandb_entity,
-            project=training_args.wandb_project,
-            name=full_wandb_run_config,
-            config={
-                "model_name": model_args.model_name_or_path,
-                "learning_rate": training_args.learning_rate,
-                "per_device_train_batch_size": training_args.per_device_train_batch_size,
-                "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
-                "effective_batch_size": effective_batch_size,
-                "num_train_epochs": training_args.num_train_epochs,
-                "max_completion_length": training_args.max_completion_length,
-                "temperature": training_args.temperature,
-                "beta": training_args.beta,
-                "lmbda": training_args.lmbda,
-                "max_length": training_args.max_length,
-                "use_peft": model_args.use_peft,
-                "lora_r": model_args.lora_r if model_args.use_peft else None,
-                "lora_alpha": model_args.lora_alpha if model_args.use_peft else None,
-                "gradient_checkpointing": training_args.gradient_checkpointing,
-                "num_processes": num_processes,
-                "use_tinker_loss": script_args.use_tinker_loss,
-                "fixed_teacher": script_args.fixed_teacher,
-                "top_k_loss": script_args.top_k_loss if script_args.top_k_loss > 0 else None,
-                "use_ema_teacher": script_args.use_ema_teacher,
-                "ema_decay": script_args.ema_decay if script_args.use_ema_teacher else None,
-            },
         )
 
     ################
@@ -242,21 +204,23 @@ if __name__ == "__main__":
     ################
     # Dataset
     ################
-    # Load the math dataset with ground truth solutions
+    # Load the Countdown-Tasks-3to4 dataset via data.py's get_data() helper.
+    # Each row carries: nums, target, prompt_student, prompt_teacher, sample_equation.
+    dataset = get_data()
+    train_dataset = dataset["train"]
+    eval_dataset = dataset["test"]
+
     ################
     # Training
     ################
     # Add presence_penalty to training_args so it can be accessed in the trainer
     training_args.presence_penalty = script_args.presence_penalty
 
-    dataset = load_dataset("siyanzhao/Openthoughts_math_30k_opsd")
-    train_dataset = dataset["train"]
-
     trainer = OPSDTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=None,
+        eval_dataset=eval_dataset,
         processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
         use_thinking_machines_loss=script_args.use_tinker_loss,
@@ -267,15 +231,6 @@ if __name__ == "__main__":
         use_ema_teacher=script_args.use_ema_teacher,
         ema_decay=script_args.ema_decay,
     )
-
-    if training_args.eval_strategy != "no":
-        generation_config = GenerationConfig(
-            max_new_tokens=training_args.max_completion_length,
-            do_sample=True,
-            temperature=training_args.temperature,
-        )
-        completions_callback = LogCompletionsCallback(trainer, generation_config, num_prompts=8)
-        trainer.add_callback(completions_callback)
 
     trainer.train()
 

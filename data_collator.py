@@ -17,20 +17,19 @@ class SelfDistillationDataCollator:
         self.max_length = max_length
         self.reason_first = reason_first
 
-        # Prompt for reasoning about the solution before teaching
+        # Prompt for reasoning about the reference equation before teaching
         self.reason_first_prompt = (
-            "\n\nThe reference reasoning above arrives at the correct answer. "
-            "Please analyze this solution and explain the key reasoning steps and problem-solving strategies employed. "
-            "Do NOT use <think> tags. Do NOT derive your own solution. "
-            "Simply analyze and explain the reference solution provided above.\n"
+            "\n\nThe reference equation above correctly reaches the target. "
+            "Please analyze this equation and explain the key decomposition and ordering "
+            "of operations that make it work. Do NOT use <think> tags. "
+            "Do NOT derive your own equation. Simply analyze and explain the reference.\n"
         )
         # Prompt for transitioning to teaching mode after reasoning
         self.transition_prompt = (
-            "\n\nAfter reading the reference solution above, make sure you truly understand "
-            "the reasoning behind each step — do not copy or paraphrase it. Now, using your "
-            "own words and independent reasoning, derive the same final answer to the problem above. "
-            "Think step by step, explore different approaches, and don't be afraid to backtrack "
-            "or reconsider if something doesn't work out:\n"
+            "\n\nNow, using your own reasoning, construct an equation for the problem "
+            "above that equals the target using each given number exactly once. "
+            "Provide the reasoning between <reasoning> and </reasoning>, and the final "
+            "expression between <answer> and </answer>.\n"
         )
 
         # Set padding side explicitly for consistency
@@ -49,29 +48,24 @@ class SelfDistillationDataCollator:
         teacher_reasoning_prompts = []  # NEW: for reason_first mode
 
         for feature in features:
-            # Extract problem and solution from dataset
-            # Handle different possible column names
-            problem = feature["problem"]
-            solution = feature["solution"]
-
-            # Student prompt: just the problem with instruction (matching evaluation format)
-            student_user_message = f"Problem: {problem}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}."
-            student_messages = [{"role": "user", "content": student_user_message}]
-
-            # Apply chat template for student (matching evaluation)
+            # Student prompt: pre-built chat messages from data.py::process_example
             student_prompt = self.tokenizer.apply_chat_template(
-                student_messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                feature["prompt_student"],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
             )
             student_prompts.append(student_prompt)
 
             if self.reason_first:
-                # Reasoning prompt: ask teacher to analyze the solution
+                # Reasoning prompt: ask teacher to analyze the reference equation
                 reasoning_user_message = (
-                    f"Problem: {problem}\n\n"
-                    f"Here is a correct reasoning to this problem:"
-                    f"=== Reference Reasoning Start ===\n"
-                    f"{solution}\n"
-                    f"=== Reference Reasoning End ===\n\n"
+                    f"Using the numbers {list(feature['nums'])}, create an equation that "
+                    f"equals {int(feature['target'])} using +, -, *, / (each number once).\n\n"
+                    f"Here is a correct reference equation for this problem:\n"
+                    f"=== Reference Equation Start ===\n"
+                    f"{feature['sample_equation']}\n"
+                    f"=== Reference Equation End ===\n"
                     f"{self.reason_first_prompt}"
                 )
                 reasoning_messages = [{"role": "user", "content": reasoning_user_message}]
@@ -84,19 +78,12 @@ class SelfDistillationDataCollator:
                 # For now, create placeholder (will be replaced in training_step)
                 teacher_prompts.append("")  # Placeholder
             else:
-                # Original teacher prompt (unchanged)
-                teacher_user_message = (
-                    f"Problem: {problem}\n\n"
-                    f"Here is a reference solution to this problem:\n"
-                    f"=== Reference Solution Begin ===\n{solution}\n=== Reference Solution End ===\n"
-                    f"{self.transition_prompt}\n"
-                    f"Please reason step by step, and put your final answer within \\boxed{{}}."
-                )
-                teacher_messages = [{"role": "user", "content": teacher_user_message}]
-
-                # Apply chat template for teacher
+                # Teacher prompt: pre-built chat messages (includes reference equation)
                 teacher_prompt = self.tokenizer.apply_chat_template(
-                    teacher_messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+                    feature["prompt_teacher"],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=True,
                 )
                 teacher_prompts.append(teacher_prompt)
 
@@ -150,7 +137,11 @@ class SelfDistillationDataCollator:
 
             # Tokenize transition prompt (this will be appended after reasoning)
             # Don't use chat template here - just the raw text
-            transition_text = f"\n{self.transition_prompt}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+            transition_text = (
+                f"\n{self.transition_prompt}\n"
+                "Provide the reasoning between <reasoning> and </reasoning>, and the "
+                "final expression between <answer> and </answer>."
+            )
             transition_encoded = self.tokenizer(
                 [transition_text] * batch_size,
                 padding=False,

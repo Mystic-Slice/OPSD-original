@@ -16,24 +16,19 @@ import os
 import random
 import textwrap
 import warnings
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from typing import Any, Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from accelerate import PartialState
-from accelerate.utils import DistributedType, broadcast_object_list, gather_object, is_peft_model
 from datasets import Dataset, IterableDataset
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers.data.data_collator import DataCollator
 from transformers.feature_extraction_utils import FeatureExtractionMixin
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.image_processing_utils import BaseImageProcessor
-from transformers.integrations.integration_utils import is_wandb_available
 from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -48,16 +43,13 @@ from transformers.utils import (
 
 from trl.data_utils import is_conversational, maybe_convert_to_chatml, pack_dataset, truncate_dataset
 from trl.extras.profiling import profiling_decorator
-from trl.extras.vllm_client import VLLMClient
 from trl.import_utils import is_vllm_available
-from trl.models import prepare_deepspeed
 from trl.models.utils import unwrap_model_for_generation
 from trl.trainer.sft_trainer import SFTTrainer
 from trl.trainer.utils import (
     DataCollatorForChatML,
     disable_dropout_in_model,
     empty_cache,
-    ensure_master_addr_port,
     pad,
 )
 from trl.experimental.gold.gold_config import GOLDConfig
@@ -65,10 +57,13 @@ from data_collator import SelfDistillationDataCollator
 
 
 if is_peft_available():
-    from peft import PeftConfig
+    from peft import PeftConfig, PeftModel
 
-if is_wandb_available():
-    import wandb
+    def is_peft_model(model) -> bool:
+        return isinstance(model, PeftModel)
+else:
+    def is_peft_model(model) -> bool:
+        return False
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
@@ -267,20 +262,6 @@ class OPSDTrainer(SFTTrainer):
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
-        self.log_completions = args.log_completions
-        self.log_completion_steps = args.log_completions_steps
-        self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
-        self.num_completions_to_print = args.num_completions_to_print
-        # maxlen is set to the total number of forward passes per step. This value of `maxlen` ensures we log only the
-        # final optimization step.
-        maxlen = self.accelerator.num_processes * args.per_device_train_batch_size * args.steps_per_generation
-        self._textual_logs = {
-            "prompt": deque(maxlen=maxlen),
-            "completion": deque(maxlen=maxlen),
-            "rewards": defaultdict(lambda: deque(maxlen=maxlen)),
-            "advantages": deque(maxlen=maxlen),
-        }
-
         self.use_vllm = args.use_vllm
         if self.use_vllm:
             if not is_vllm_available():
@@ -289,70 +270,31 @@ class OPSDTrainer(SFTTrainer):
                     "`pip install vllm` to use it."
                 )
             self.vllm_mode = args.vllm_mode
-            self.vllm_tensor_parallel_size = args.vllm_tensor_parallel_size
             self.vllm_gpu_memory_utilization = args.vllm_gpu_memory_utilization
             self.vllm_enable_sleep_mode = args.vllm_enable_sleep_mode
-            if self.vllm_mode == "server":
-                if self.accelerator.is_main_process:
-                    self.vllm_client = VLLMClient(
-                        host=args.vllm_server_host,
-                        server_port=args.vllm_server_port,
-                        connection_timeout=args.vllm_server_timeout,
-                    )
-                    self.vllm_client.init_communicator()
-            elif self.vllm_mode == "colocate":
-                student_model_name_or_path = self.model_name_or_path
-
-                # Make sure tensor_parallel_size divides world size evenly
-                if not self.accelerator.num_processes % self.vllm_tensor_parallel_size == 0:
-                    raise ValueError(
-                        f"vllm_tensor_parallel_size ({self.vllm_tensor_parallel_size}) must divide world size "
-                        f"({self.accelerator.num_processes}) evenly."
-                    )
-
-                if self.vllm_tensor_parallel_size > 1:
-                    # Create subgroups of ranks for TP
-                    self.vllm_tp_group, _ = torch.distributed.new_subgroups_by_enumeration(
-                        [
-                            list(
-                                range(
-                                    i * self.vllm_tensor_parallel_size,
-                                    (i + 1) * self.vllm_tensor_parallel_size,
-                                )
-                            )
-                            for i in range(self.accelerator.num_processes // self.vllm_tensor_parallel_size)
-                        ]
-                    )
-
-                # vLLM requires the environment variables to be set for distributed training.
-                os.environ["RANK"] = str(self.accelerator.process_index)
-                os.environ["LOCAL_RANK"] = str(self.accelerator.local_process_index)
-                os.environ["WORLD_SIZE"] = str(self.accelerator.num_processes)
-                ensure_master_addr_port()
-
-                self.vllm_engine = LLM(
-                    model=student_model_name_or_path,
-                    revision=self.model_revision,
-                    tensor_parallel_size=self.vllm_tensor_parallel_size,
-                    gpu_memory_utilization=self.vllm_gpu_memory_utilization,
-                    max_num_seqs=self.args.per_device_train_batch_size
-                    * self.args.gradient_accumulation_steps,
-                    max_model_len=args.max_length,
-                    distributed_executor_backend="external_launcher",
-                    # Feed identical seed for tp groups to ensure sampling results are the same across workers
-                    seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
-                    enable_sleep_mode=self.vllm_enable_sleep_mode,
+            if self.vllm_mode != "colocate":
+                raise ValueError(
+                    f"Only vllm_mode='colocate' is supported on single-GPU training (got {self.vllm_mode!r})."
                 )
 
-                if self.vllm_enable_sleep_mode:
-                    self.vllm_engine.sleep(level=2)
+            student_model_name_or_path = self.model_name_or_path
 
-                # When using vLLM, the main process is responsible for loading the model weights. This can cause process
-                # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
-                # synchronize all processes after vLLM has been fully initialized.
-                self.accelerator.wait_for_everyone()
-            else:
-                raise ValueError(f"Unknown vllm_mode: {self.vllm_mode}")
+            self.vllm_engine = LLM(
+                model=student_model_name_or_path,
+                revision=self.model_revision,
+                tensor_parallel_size=1,
+                gpu_memory_utilization=self.vllm_gpu_memory_utilization,
+                max_num_seqs=self.args.per_device_train_batch_size
+                * self.args.gradient_accumulation_steps,
+                max_model_len=args.max_length,
+                distributed_executor_backend="external_launcher",
+                seed=0,
+                enable_sleep_mode=self.vllm_enable_sleep_mode,
+            )
+
+            if self.vllm_enable_sleep_mode:
+                self.vllm_engine.sleep(level=2)
+
             self.vllm_guided_decoding_regex = args.vllm_guided_decoding_regex
             self.vllm_sync_frequency = args.vllm_sync_frequency
             self._last_vllm_sync_step = -1
@@ -362,8 +304,11 @@ class OPSDTrainer(SFTTrainer):
     def _set_signature_columns_if_needed(self):
         super()._set_signature_columns_if_needed()
         required_columns = [
-            "problem",
-            "solution",
+            "nums",
+            "target",
+            "prompt_student",
+            "prompt_teacher",
+            "sample_equation",
         ]
         if self._signature_columns is None:
             self._signature_columns = required_columns
@@ -481,71 +426,33 @@ class OPSDTrainer(SFTTrainer):
 
         Only trainable parameters are tracked (i.e. LoRA adapter weights for PEFT models,
         or all parameters for full fine-tuning).
-
-        ZeRO-3 note: with ZeRO-3 each rank only holds a shard of every parameter.
-        We use `deepspeed.zero.GatheredParameters` (read-only, modifier_rank=None) so that
-        every rank sees the full parameter tensor when snapshotting / updating the EMA.
-        The EMA tensors are therefore full-sized copies, which is also required by
-        `_ema_teacher_context` when it swaps the gathered student weights with EMA values.
         """
         decay = self.ema_decay
         unwrapped = self.accelerator.unwrap_model(self.model)
 
-        # Detect ZeRO-3 (same pattern used elsewhere in this file)
-        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
-        zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
+        if self._ema_params is None:
+            # Lazy init: snapshot the current weights as the initial EMA state.
+            self._ema_params = {
+                name: param.data.clone().detach()
+                for name, param in unwrapped.named_parameters()
+                if param.requires_grad
+            }
+            n_tensors = len(self._ema_params)
+            n_params = sum(p.numel() for p in self._ema_params.values())
+            print(
+                f"\nEMA teacher initialized: {n_tensors} tensors, {n_params:,} parameters "
+                f"(decay={decay})"
+            )
+            return  # first call = initialization only, no decay update
 
-        if zero_stage_3:
-            import deepspeed
-
-            trainable = [(name, param) for name, param in unwrapped.named_parameters() if param.requires_grad]
-            params_list = [p for _, p in trainable]
-
-            # modifier_rank=None → read-only gather; original partitions are restored on exit.
-            with deepspeed.zero.GatheredParameters(params_list):
-                if self._ema_params is None:
-                    self._ema_params = {name: param.data.clone().detach() for name, param in trainable}
-                    n_tensors = len(self._ema_params)
-                    n_params = sum(p.numel() for p in self._ema_params.values())
-                    print(
-                        f"\nEMA teacher initialized: {n_tensors} tensors, {n_params:,} parameters "
-                        f"(decay={decay})"
-                    )
-                    return  # first call = initialization only, no decay update
-
-                for name, param in trainable:
-                    if name not in self._ema_params:
-                        continue
-                    ema = self._ema_params[name]
-                    if ema.device != param.data.device:
-                        ema = ema.to(param.data.device)
-                        self._ema_params[name] = ema
-                    ema.mul_(decay).add_(param.data, alpha=1.0 - decay)
-        else:
-            if self._ema_params is None:
-                # Lazy init: snapshot the current weights as the initial EMA state.
-                self._ema_params = {
-                    name: param.data.clone().detach()
-                    for name, param in unwrapped.named_parameters()
-                    if param.requires_grad
-                }
-                n_tensors = len(self._ema_params)
-                n_params = sum(p.numel() for p in self._ema_params.values())
-                print(
-                    f"\nEMA teacher initialized: {n_tensors} tensors, {n_params:,} parameters "
-                    f"(decay={decay})"
-                )
-                return  # first call = initialization only, no decay update
-
-            for name, param in unwrapped.named_parameters():
-                if not param.requires_grad or name not in self._ema_params:
-                    continue
-                ema = self._ema_params[name]
-                # Move EMA buffer to the same device as the live param (handles multi-GPU setups)
-                if ema.device != param.data.device:
-                    ema = ema.to(param.data.device)
-                    self._ema_params[name] = ema
-                ema.mul_(decay).add_(param.data, alpha=1.0 - decay)
+        for name, param in unwrapped.named_parameters():
+            if not param.requires_grad or name not in self._ema_params:
+                continue
+            ema = self._ema_params[name]
+            if ema.device != param.data.device:
+                ema = ema.to(param.data.device)
+                self._ema_params[name] = ema
+            ema.mul_(decay).add_(param.data, alpha=1.0 - decay)
 
     @contextmanager
     def _ema_teacher_context(self, model):
@@ -553,14 +460,8 @@ class OPSDTrainer(SFTTrainer):
 
         Swaps `param.data` of every tracked (trainable) parameter with its EMA counterpart,
         runs the body (teacher forward), then restores the student weights unconditionally.
-        Safe to use inside `torch.no_grad()`.  If EMA has not been initialized yet (step 0),
+        Safe to use inside `torch.no_grad()`. If EMA has not been initialized yet (step 0),
         this is a no-op and the current student weights are used instead.
-
-        ZeRO-3 note: direct `param.data` assignment bypasses ZeRO-3's shard lifecycle and
-        corrupts its internal state, causing size-mismatch errors during gradient-checkpoint
-        recomputation.  When ZeRO-3 is active we therefore wrap the swap inside
-        `deepspeed.zero.GatheredParameters` so the parameters are fully materialised on every
-        rank before we touch them, and ZeRO-3 re-partitions cleanly when the context exits.
         """
         if self._ema_params is None:
             yield  # EMA not yet initialized; fall back to current weights
@@ -568,54 +469,22 @@ class OPSDTrainer(SFTTrainer):
 
         unwrapped = self.accelerator.unwrap_model(model)
 
-        # Detect ZeRO-3 (same pattern used elsewhere in this file)
-        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
-        zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
-
-        if zero_stage_3:
-            import deepspeed
-
-            name_to_param = {
-                name: param
-                for name, param in unwrapped.named_parameters()
-                if param.requires_grad and name in self._ema_params
-            }
-            params_list = list(name_to_param.values())
-
-            # modifier_rank=0 causes ZeRO-3 to re-partition from rank-0's param.data on exit,
-            # which will be the restored student weights.
-            with deepspeed.zero.GatheredParameters(params_list, modifier_rank=0):
-                saved = {}
-                for name, param in name_to_param.items():
-                    ema = self._ema_params[name]
-                    if ema.device != param.data.device:
-                        ema = ema.to(param.data.device)
-                        self._ema_params[name] = ema
-                    saved[name] = param.data.clone()
-                    param.data.copy_(ema)
-                try:
-                    yield
-                finally:
-                    for name, param in name_to_param.items():
-                        if name in saved:
-                            param.data.copy_(saved[name])
-        else:
-            saved = {}
+        saved = {}
+        for name, param in unwrapped.named_parameters():
+            if not param.requires_grad or name not in self._ema_params:
+                continue
+            ema = self._ema_params[name]
+            if ema.device != param.data.device:
+                ema = ema.to(param.data.device)
+                self._ema_params[name] = ema
+            saved[name] = param.data
+            param.data = ema
+        try:
+            yield
+        finally:
             for name, param in unwrapped.named_parameters():
-                if not param.requires_grad or name not in self._ema_params:
-                    continue
-                ema = self._ema_params[name]
-                if ema.device != param.data.device:
-                    ema = ema.to(param.data.device)
-                    self._ema_params[name] = ema
-                saved[name] = param.data
-                param.data = ema
-            try:
-                yield
-            finally:
-                for name, param in unwrapped.named_parameters():
-                    if name in saved:
-                        param.data = saved[name]
+                if name in saved:
+                    param.data = saved[name]
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -886,76 +755,31 @@ class OPSDTrainer(SFTTrainer):
         # Start timing for vLLM generation
         start_time = time.time()
 
-        if self.vllm_mode == "server":
-            all_prompts_text = gather_object(prompts_text_for_vllm)
-            if self.accelerator.is_main_process:
-                completion_ids = self.vllm_client.generate(
-                    prompts=all_prompts_text,
-                    n=1,  # In GKD, we generate 1 completion per prompt from student
-                    repetition_penalty=repetition_penalty,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    min_p=min_p,
-                    max_tokens=max_completion_length,
-                    presence_penalty=presence_penalty,
-                    guided_decoding_regex=self.vllm_guided_decoding_regex,
-                )
-            else:
-                completion_ids = [None] * len(all_prompts_text)
-            completion_ids = broadcast_object_list(completion_ids, from_process=0)
-            process_slice = slice(
-                self.accelerator.process_index * len(prompts_text_for_vllm),
-                (self.accelerator.process_index + 1) * len(prompts_text_for_vllm),
+        if self.vllm_guided_decoding_regex:
+            guided_decoding = GuidedDecodingParams(
+                backend="outlines", regex=self.vllm_guided_decoding_regex
             )
-            completion_ids = completion_ids[process_slice]
-        elif self.vllm_mode == "colocate":
-            if self.vllm_guided_decoding_regex:
-                guided_decoding = GuidedDecodingParams(
-                    backend="outlines", regex=self.vllm_guided_decoding_regex
-                )
-            else:
-                guided_decoding = None
-            sampling_params = SamplingParams(
-                n=1,
-                repetition_penalty=repetition_penalty,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                max_tokens=max_completion_length,
-                presence_penalty=presence_penalty,
-                guided_decoding=guided_decoding,
-            )
-
-            if hasattr(self, "vllm_tp_group") and self.vllm_tensor_parallel_size > 1:
-                # Gather prompts from all ranks in the TP group and flatten.
-                # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
-                orig_size = len(prompts_text_for_vllm)
-                gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
-                torch.distributed.all_gather_object(
-                    gathered_prompts, prompts_text_for_vllm, group=self.vllm_tp_group
-                )
-                all_prompts_text = [p for sublist in gathered_prompts for p in sublist]
-            else:
-                all_prompts_text = prompts_text_for_vllm
-
-            all_outputs = self.vllm_engine.generate(
-                all_prompts_text, sampling_params=sampling_params, use_tqdm=False
-            )
-            completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
-
-            if hasattr(self, "vllm_tp_group") and self.vllm_tensor_parallel_size > 1:
-                # Slice completions for this rank within its TP group.
-                # Each rank generates all outputs — we keep only our share.
-                local_rank_in_group = torch.distributed.get_rank(group=self.vllm_tp_group)
-                tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
-                completion_ids = completion_ids[tp_slice]
-
-            if self.vllm_enable_sleep_mode:
-                self.vllm_engine.sleep(level=2)
         else:
-            raise ValueError(f"Unknown vllm_mode: {self.vllm_mode}")
+            guided_decoding = None
+        sampling_params = SamplingParams(
+            n=1,
+            repetition_penalty=repetition_penalty,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            max_tokens=max_completion_length,
+            presence_penalty=presence_penalty,
+            guided_decoding=guided_decoding,
+        )
+
+        all_outputs = self.vllm_engine.generate(
+            prompts_text_for_vllm, sampling_params=sampling_params, use_tqdm=False
+        )
+        completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
+
+        if self.vllm_enable_sleep_mode:
+            self.vllm_engine.sleep(level=2)
 
         # Calculate and print vLLM generation statistics
         elapsed_time = time.time() - start_time
@@ -1061,55 +885,21 @@ class OPSDTrainer(SFTTrainer):
 
         start_time = time.time()
 
-        if self.vllm_mode == "server":
-            all_prompts_text = gather_object(prompts_text)
-            if self.accelerator.is_main_process:
-                completion_ids = self.vllm_client.generate(
-                    prompts=all_prompts_text,
-                    n=1,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    max_tokens=max_reasoning_length,
-                )
-            else:
-                completion_ids = [None] * len(all_prompts_text)
-            completion_ids = broadcast_object_list(completion_ids, from_process=0)
-            process_slice = slice(
-                self.accelerator.process_index * len(prompts_text),
-                (self.accelerator.process_index + 1) * len(prompts_text),
-            )
-            completion_ids = completion_ids[process_slice]
+        sampling_params = SamplingParams(
+            n=1,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_tokens=max_reasoning_length,
+        )
 
-        elif self.vllm_mode == "colocate":
-            sampling_params = SamplingParams(
-                n=1,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                max_tokens=max_reasoning_length,
-            )
+        all_outputs = self.vllm_engine.generate(
+            prompts_text, sampling_params=sampling_params, use_tqdm=False
+        )
+        completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
 
-            if hasattr(self, "vllm_tp_group") and self.vllm_tensor_parallel_size > 1:
-                orig_size = len(prompts_text)
-                gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
-                torch.distributed.all_gather_object(gathered_prompts, prompts_text, group=self.vllm_tp_group)
-                all_prompts_text = [p for sublist in gathered_prompts for p in sublist]
-            else:
-                all_prompts_text = prompts_text
-
-            all_outputs = self.vllm_engine.generate(
-                all_prompts_text, sampling_params=sampling_params, use_tqdm=False
-            )
-            completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
-
-            if hasattr(self, "vllm_tp_group") and self.vllm_tensor_parallel_size > 1:
-                local_rank_in_group = torch.distributed.get_rank(group=self.vllm_tp_group)
-                tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
-                completion_ids = completion_ids[tp_slice]
-
-            if self.vllm_enable_sleep_mode:
-                self.vllm_engine.sleep(level=2)
+        if self.vllm_enable_sleep_mode:
+            self.vllm_engine.sleep(level=2)
 
         elapsed_time = time.time() - start_time
         total_tokens = sum(len(ids) for ids in completion_ids)
@@ -1137,109 +927,37 @@ class OPSDTrainer(SFTTrainer):
 
         return reasoning_ids
 
-    def _sync_fsdp_params_to_vllm(self, module: nn.Module, prefix: str = "", visited=None):
-        """Memory-efficient post-order traversal of FSDP modules to extract full parameters and sync with student vLLM."""
-        if visited is None:
-            visited = set()
-
-        for child_name, child_module in module.named_children():
-            child_prefix = f"{prefix}.{child_name}" if prefix else child_name
-            # recurse into the child
-            self._sync_fsdp_params_to_vllm(child_module, prefix=child_prefix, visited=visited)
-
-        if isinstance(module, FSDP):
-            with FSDP.summon_full_params(module, recurse=False, writeback=False):
-                for param_name, param in module.named_parameters():
-                    full_name = f"{prefix}.{param_name}" if prefix else param_name
-                    for extra in ("_fsdp_wrapped_module.", "_checkpoint_wrapped_module."):
-                        full_name = full_name.replace(extra, "")
-
-                    if full_name in visited:
-                        continue  # skip FSDP subtrees already traversed
-                    visited.add(full_name)
-
-                    if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                        self.vllm_client.update_named_param(full_name, param.data)
-                    elif self.vllm_mode == "colocate":
-                        llm_model = (
-                            self.vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
-                        )
-                        llm_model.load_weights([(full_name, param.data)])
-
     def _move_model_to_vllm(self):
-        """Synchronize student model weights to vLLM engine."""
-        # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
-        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
-        zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
-        if zero_stage_3:
-            import deepspeed
-
-            gather_if_zero3 = deepspeed.zero.GatheredParameters
-        else:
-            gather_if_zero3 = nullcontext
-
-        if self.vllm_mode == "colocate" and self.vllm_enable_sleep_mode:
+        """Synchronize student model weights to the colocate vLLM engine (single GPU)."""
+        if self.vllm_enable_sleep_mode:
             empty_cache()
             self.vllm_engine.wake_up(tags=["weights"])
 
+        llm_model = self.vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
+
         if is_peft_model(self.model):
-            # With PEFT and FSDP/DeepSpeed ZeRO Stage 3, we must gather the full model at once before merging, as
-            # merging adapters in a sharded manner is not supported.
-            with gather_if_zero3(list(self.model.parameters())):
-                self.model.merge_adapter()
-
-                # Update vLLM weights while parameters are gathered
-                if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
-                    # Update vLLM weights while parameters are gathered
-                    # For PEFT with FSDP we need to use the memory efficient post-order traversal
-                    self._sync_fsdp_params_to_vllm(self.model)
-                else:
-                    # DeepSpeed ZeRO-3 with PEFT
-                    for name, param in self.model.named_parameters():
-                        # When using PEFT, we need to recover the original parameter name and discard some parameters
-                        name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                        if self.model.prefix in name:
-                            continue
-                        # When module to save, remove its prefix and discard the original module
-                        if "original_module" in name:
-                            continue
-                        name = name.replace("modules_to_save.default.", "")
-
-                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                            self.vllm_client.update_named_param(name, param.data)
-                        elif self.vllm_mode == "colocate":
-                            llm_model = (
-                                self.vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
-                            )
-                            llm_model.load_weights([(name, param.data)])
-                # Unmerge adapters while parameters are still gathered
-                self.model.unmerge_adapter()
-                # Parameters will automatically be repartitioned when exiting the context
-        else:
-            # For non-PEFT models, simply gather (if needed) and update each parameter individually.
-            if self.is_fsdp_enabled:
-                # use memory-efficient post-order traversal for FSDP
-                self._sync_fsdp_params_to_vllm(self.model)
-            else:
-                # For DeepSpeed ZeRO-3, gather each parameter individually like GRPO trainer
+            # Merge LoRA adapters into the base weights before copying.
+            self.model.merge_adapter()
+            try:
                 for name, param in self.model.named_parameters():
-                    with gather_if_zero3([param]):
-                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                            self.vllm_client.update_named_param(name, param.data)
-                        elif self.vllm_mode == "colocate":
-                            llm_model = (
-                                self.vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
-                            )
-                            llm_model.load_weights([(name, param.data)])
+                    # Recover the original parameter name and drop PEFT-internal entries.
+                    name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                    if self.model.prefix in name:
+                        continue
+                    if "original_module" in name:
+                        continue
+                    name = name.replace("modules_to_save.default.", "")
+                    llm_model.load_weights([(name, param.data)])
+            finally:
+                self.model.unmerge_adapter()
+        else:
+            for name, param in self.model.named_parameters():
+                llm_model.load_weights([(name, param.data)])
 
-        # Reset cache on vLLM
-        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-            self.vllm_client.reset_prefix_cache()
-        elif self.vllm_mode == "colocate":
-            self.vllm_engine.reset_prefix_cache()
+        self.vllm_engine.reset_prefix_cache()
 
     def _wake_vllm_if_needed(self):
-        if self.vllm_mode == "colocate" and self.vllm_enable_sleep_mode:
+        if self.vllm_enable_sleep_mode:
             empty_cache()
             self.vllm_engine.wake_up(tags=["kv_cache"])
 
@@ -1412,10 +1130,6 @@ class OPSDTrainer(SFTTrainer):
 
         inputs["labels"] = labels
 
-        # Log prompt and completion texts
-        self._textual_logs["prompt"].extend(gather_object(prompt_texts))
-        self._textual_logs["completion"].extend(gather_object(completion_texts))
-
         # Collect generation outputs for saving
         for prompt, completion in zip(prompt_texts, completion_texts):
             self._generation_outputs_buffer.append(
@@ -1461,33 +1175,11 @@ class OPSDTrainer(SFTTrainer):
         }  # average the metrics
 
         if mode == "train":
-            device = self.accelerator.device if hasattr(self.accelerator, "device") else torch.device("cpu")
-            # Track on/off-policy loss statistics
-            vec = torch.tensor(
-                [
-                    self._on_policy_loss_total,
-                    self._off_policy_loss_total,
-                    self._on_policy_step_equiv,
-                    self._off_policy_step_equiv,
-                ],
-                dtype=torch.float64,
-                device=device,
-            )
-
-            # Sum across processes so we mirror Trainer's distributed reduction
-            if (
-                getattr(self.accelerator, "distributed_type", DistributedType.NO) != DistributedType.NO
-                and dist.is_available()
-                and dist.is_initialized()
-            ):
-                dist.all_reduce(vec, op=dist.ReduceOp.SUM)
-
-            (
-                on_sum,
-                off_sum,
-                on_eq,
-                off_eq,
-            ) = vec.tolist()
+            # Single-GPU: no cross-process reduction needed — read the local accumulators directly.
+            on_sum = self._on_policy_loss_total
+            off_sum = self._off_policy_loss_total
+            on_eq = self._on_policy_step_equiv
+            off_eq = self._off_policy_step_equiv
 
             # Compute category averages over the *same window* as Trainer's logs
             # (avoid div-by-zero if, e.g., no on-policy steps in the window)
@@ -1508,24 +1200,3 @@ class OPSDTrainer(SFTTrainer):
         logs = {**logs, **metrics}
         super().log(logs, start_time)
         self._metrics[mode].clear()
-
-        if (
-            self.accelerator.is_main_process
-            and self.log_completions
-            and ((self.state.global_step % self.log_completion_steps) == 0)
-        ):
-
-            if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
-                import pandas as pd
-
-                table = {
-                    "step": [str(self.state.global_step)] * len(self._textual_logs["prompt"]),
-                    "prompt": self._textual_logs["prompt"],
-                    "completion": self._textual_logs["completion"],
-                }
-                df = pd.DataFrame(table)
-                if self.wandb_log_unique_prompts:
-                    df = df.drop_duplicates(subset=["prompt"])
-                if self.num_completions_to_print and len(df) > 0:
-                    df = df.sample(n=self.num_completions_to_print, random_state=42)
-                wandb.log({"completions": wandb.Table(dataframe=df)})

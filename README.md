@@ -43,12 +43,12 @@ The code uses `trl`'s experimental GOLD trainer as a base.
 ```
 ├── opsd_trainer.py          # OPSDTrainer: core self-distillation trainer
 ├── data_collator.py         # Data collator for self-distillation
-├── opsd_train.py            # OPSD training entry point
+├── data.py                  # Countdown-Tasks-3to4 loader + scoring helpers
+├── opsd_train.py            # OPSD training entry point (single GPU)
 ├── sft_train.py             # SFT baseline training entry point
 ├── grpo_train.py            # GRPO baseline training entry point
-├── accelerate.yaml          # Accelerate config (multi-GPU)
 ├── scripts/
-│   ├── run_opsd.sh          # Example launch script for OPSD
+│   ├── run_opsd_1b.sh       # Example launch script for OPSD (single GPU)
 │   ├── run_sft.sh           # Example launch script for SFT
 │   └── run_grpo.sh          # Example launch script for GRPO
 └── eval/
